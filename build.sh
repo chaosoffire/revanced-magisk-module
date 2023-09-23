@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-trap "rm -rf temp/tmp.*; exit 130" INT
+trap "rm -rf temp/*tmp.* temp/*/*tmp.*; exit 130" INT
 
 if [ "${1:-}" = "clean" ]; then
 	rm -rf temp build logs build.md
@@ -22,71 +22,89 @@ if [ "$ENABLE_MAGISK_UPDATE" = true ] && [ -z "${GITHUB_REPOSITORY:-}" ]; then
 	pr "You are building locally. Magisk updates will not be enabled."
 	ENABLE_MAGISK_UPDATE=false
 fi
-BUILD_MINDETACH_MODULE=$(toml_get "$main_config_t" build-mindetach-module) || BUILD_MINDETACH_MODULE=false
-if [ "$BUILD_MINDETACH_MODULE" = true ] && [ ! -f "mindetach-magisk/mindetach/detach.txt" ]; then
-	pr "mindetach module was not found."
-	BUILD_MINDETACH_MODULE=false
-fi
 if ! PARALLEL_JOBS=$(toml_get "$main_config_t" parallel-jobs); then
 	if [ "$OS" = Android ]; then PARALLEL_JOBS=1; else PARALLEL_JOBS=$(nproc); fi
 fi
 LOGGING_F=$(toml_get "$main_config_t" logging-to-file) && vtf "$LOGGING_F" "logging-to-file" || LOGGING_F=false
-CONF_PATCHES_VER=$(toml_get "$main_config_t" patches-version) || CONF_PATCHES_VER=
-CONF_INTEGRATIONS_VER=$(toml_get "$main_config_t" integrations-version) || CONF_INTEGRATIONS_VER=
-DEF_PATCHES_SRC=$(toml_get "$main_config_t" patches-source) || DEF_PATCHES_SRC="revanced/revanced-patches"
-DEF_INTEGRATIONS_SRC=$(toml_get "$main_config_t" integrations-source) || DEF_INTEGRATIONS_SRC="revanced/revanced-integrations"
+DEF_PATCHES_VER=$(toml_get "$main_config_t" patches-version) || DEF_PATCHES_VER=""
+DEF_INTEGRATIONS_VER=$(toml_get "$main_config_t" integrations-version) || DEF_INTEGRATIONS_VER=""
+DEF_CLI_VER=$(toml_get "$main_config_t" cli-version) || DEF_CLI_VER=""
+DEF_PATCHES_SRC=$(toml_get "$main_config_t" patches-source) || DEF_PATCHES_SRC="ReVanced/revanced-patches"
+DEF_INTEGRATIONS_SRC=$(toml_get "$main_config_t" integrations-source) || DEF_INTEGRATIONS_SRC="ReVanced/revanced-integrations"
+DEF_CLI_SRC=$(toml_get "$main_config_t" cli-source) || DEF_CLI_SRC="j-hc/revanced-cli"
 DEF_RV_BRAND=$(toml_get "$main_config_t" rv-brand) || DEF_RV_BRAND="ReVanced"
 # -- Main config --
 mkdir -p $TEMP_DIR $BUILD_DIR
 
 if ((COMPRESSION_LEVEL > 9)) || ((COMPRESSION_LEVEL < 0)); then abort "compression-level must be within 0-9"; fi
-if [ "$BUILD_MINDETACH_MODULE" = true ]; then : >$PKGS_LIST; fi
 if [ "$LOGGING_F" = true ]; then mkdir -p logs; fi
 
 #check_deps
 jq --version >/dev/null || abort "\`jq\` is not installed. install it with 'apt install jq' or equivalent"
-java --version >/dev/null || abort "\`openjdk 17\` is not installed. install it with 'apt install openjdk-17-jre-headless' or equivalent"
+java --version >/dev/null || abort "\`openjdk 17\` is not installed. install it with 'apt install openjdk-17-jre' or equivalent"
 zip --version >/dev/null || abort "\`zip\` is not installed. install it with 'apt install zip' or equivalent"
 # --
 get_prebuilts
 
 set_prebuilts() {
-	app_args[cli]=$(find "$1" -name "revanced-cli-*.jar" -type f -print -quit 2>/dev/null) && [ "${app_args[cli]}" ] || return 1
-	app_args[integ]=$(find "$1" -name "revanced-integrations-*.apk" -type f -print -quit 2>/dev/null) && [ "${app_args[integ]}" ] || return 1
-	app_args[ptjar]=$(find "$1" -name "revanced-patches-*.jar" -type f -print -quit 2>/dev/null) && [ "${app_args[ptjar]}" ] || return 1
-	app_args[ptjs]=$(find "$1" -name "patches-*.json" -type f -print -quit 2>/dev/null) && [ "${app_args[ptjs]}" ] || return 1
+	local integrations_src=$1 patches_src=$2 cli_src=$3 integrations_ver=$4 patches_ver=$5 cli_ver=$6
+	local patches_dir=${patches_src%/*}
+	local integrations_dir=${integrations_src%/*}
+	local cli_dir=${cli_src%/*}
+	cli_ver=${cli_ver#v}
+	integrations_ver="${integrations_ver#v}"
+	patches_ver="${patches_ver#v}"
+	app_args[cli]=$(find "${TEMP_DIR}/${cli_dir,,}-rv" -name "revanced-cli-${cli_ver:-*}-all.jar" -type f -print -quit 2>/dev/null) && [ "${app_args[cli]}" ] || return 1
+	app_args[integ]=$(find "${TEMP_DIR}/${integrations_dir,,}-rv" -name "revanced-integrations-${integrations_ver:-*}.apk" -type f -print -quit 2>/dev/null) && [ "${app_args[integ]}" ] || return 1
+	app_args[ptjar]=$(find "${TEMP_DIR}/${patches_dir,,}-rv" -name "revanced-patches-${patches_ver:-*}.jar" -type f -print -quit 2>/dev/null) && [ "${app_args[ptjar]}" ] || return 1
+	app_args[ptjs]=$(find "${TEMP_DIR}/${patches_dir,,}-rv" -name "patches-${patches_ver:-*}.json" -type f -print -quit 2>/dev/null) && [ "${app_args[ptjs]}" ] || return 1
 }
 
 build_rv_w() {
 	if [ "$LOGGING_F" = true ]; then
 		logf=logs/"${table_name,,}.log"
 		: >"$logf"
-		build_rv 2>&1 "$(declare -p app_args)" | tee "$logf"
+		{ build_rv 2>&1 "$(declare -p app_args)" | tee "$logf"; } &
 	else
-		build_rv "$(declare -p app_args)"
+		build_rv "$(declare -p app_args)" &
 	fi
 }
 
+declare -A cliriplib
 idx=0
 for table_name in $(toml_get_table_names); do
 	if [ -z "$table_name" ]; then continue; fi
 	t=$(toml_get_table "$table_name")
 	enabled=$(toml_get "$t" enabled) && vtf "$enabled" "enabled" || enabled=true
 	if [ "$enabled" = false ]; then continue; fi
+	if ((idx >= PARALLEL_JOBS)); then wait -n; fi
 
-	if ((idx >= PARALLEL_JOBS)); then wait -n; else idx=$((idx + 1)); fi
 	declare -A app_args
 	patches_src=$(toml_get "$t" patches-source) || patches_src=$DEF_PATCHES_SRC
+	patches_ver=$(toml_get "$t" patches-version) || patches_ver=$DEF_PATCHES_VER
 	integrations_src=$(toml_get "$t" integrations-source) || integrations_src=$DEF_INTEGRATIONS_SRC
-	prebuilts_dir=${patches_src%/*}
-	prebuilts_dir=${TEMP_DIR}/${prebuilts_dir//[^[:alnum:]]/}-rv
-	if ! set_prebuilts "$prebuilts_dir"; then
-		mkdir -p "$prebuilts_dir"
-		read -r rv_cli_jar rv_integrations_apk rv_patches_jar rv_patches_json <<<"$(get_rv_prebuilts "$integrations_src" "$patches_src" "$prebuilts_dir")"
+	integrations_ver=$(toml_get "$t" integrations-version) || integrations_ver=$DEF_INTEGRATIONS_VER
+	cli_src=$(toml_get "$t" cli-source) || cli_src=$DEF_CLI_SRC
+	cli_ver=$(toml_get "$t" cli-version) || cli_ver=$DEF_CLI_VER
+
+	if ! set_prebuilts "$integrations_src" "$patches_src" "$cli_src" "$integrations_ver" "$patches_ver" "$cli_ver"; then
+		if ! RVP="$(get_rv_prebuilts "$integrations_src" "$patches_src" "$integrations_ver" "$patches_ver" "$cli_src" "$cli_ver")"; then
+			abort "could not download rv prebuilts"
+		fi
+		read -r rv_cli_jar rv_integrations_apk rv_patches_jar rv_patches_json <<<"$RVP"
 		app_args[cli]=$rv_cli_jar
 		app_args[integ]=$rv_integrations_apk
 		app_args[ptjar]=$rv_patches_jar
 		app_args[ptjs]=$rv_patches_json
+	fi
+	if [[ -v cliriplib[${app_args[cli]}] ]]; then app_args[riplib]=${cliriplib[${app_args[cli]}]}; else
+		if [[ $(java -jar "${app_args[cli]}" patch 2>&1) == *rip-lib* ]]; then
+			cliriplib[${app_args[cli]}]=true
+			app_args[riplib]=true
+		else
+			cliriplib[${app_args[cli]}]=false
+			app_args[riplib]=false
+		fi
 	fi
 	app_args[rv_brand]=$(toml_get "$t" rv-brand) || app_args[rv_brand]="$DEF_RV_BRAND"
 
@@ -116,14 +134,10 @@ for table_name in $(toml_get_table_names); do
 		app_args[dl_from]=apkmirror
 	} || app_args[apkmirror_dlurl]=""
 	if [ -z "${app_args[dl_from]:-}" ]; then abort "ERROR: no 'apkmirror_dlurl', 'uptodown_dlurl' or 'apkmonk_dlurl' option was set for '$table_name'."; fi
-	app_args[arch]=$(toml_get "$t" arch) && {
-		if ! isoneof "${app_args[arch]}" universal both arm64-v8a arm-v7a; then
-			abort "ERROR: arch '${app_args[arch]}' is not a valid option for '${table_name}': only 'universal', 'arm64-v8a', 'arm-v7a', 'both' is allowed"
-		fi
-	} || app_args[arch]="universal"
+	app_args[arch]=$(toml_get "$t" apkmirror-arch) || app_args[arch]="universal"
 	app_args[include_stock]=$(toml_get "$t" include-stock) || app_args[include_stock]=true && vtf "${app_args[include_stock]}" "include-stock"
 	app_args[merge_integrations]=$(toml_get "$t" merge-integrations) || app_args[merge_integrations]=true && vtf "${app_args[merge_integrations]}" "merge-integrations"
-	app_args[dpi]=$(toml_get "$t" dpi) || app_args[dpi]="nodpi"
+	app_args[dpi]=$(toml_get "$t" apkmirror-dpi) || app_args[dpi]="nodpi"
 	table_name_f=${table_name,,}
 	table_name_f=${table_name_f// /-}
 	app_args[module_prop_name]=$(toml_get "$t" module-prop-name) || app_args[module_prop_name]="${table_name_f}-jhc"
@@ -132,26 +146,22 @@ for table_name in $(toml_get_table_names); do
 		app_args[table]="$table_name (arm64-v8a)"
 		app_args[module_prop_name]="${app_args[module_prop_name]}-arm64"
 		app_args[arch]="arm64-v8a"
+		idx=$((idx + 1))
 		build_rv_w
 		app_args[table]="$table_name (arm-v7a)"
 		app_args[module_prop_name]="${app_args[module_prop_name]}-arm"
 		app_args[arch]="arm-v7a"
-		build_rv_w &
+		if ((idx >= PARALLEL_JOBS)); then wait -n; fi
+		idx=$((idx + 1))
+		build_rv_w
 	else
-		build_rv_w &
+		idx=$((idx + 1))
+		build_rv_w
 	fi
 done
 wait
 rm -rf temp/tmp.*
 if [ -z "$(ls -A1 ${BUILD_DIR})" ]; then abort "All builds failed."; fi
-
-if [ "$BUILD_MINDETACH_MODULE" = true ]; then
-	pr "Building mindetach module"
-	cp -f $PKGS_LIST mindetach-magisk/mindetach/detach.txt
-	pushd mindetach-magisk/mindetach/
-	zip -qr ../../build/mindetach-"$(grep version= module.prop | cut -d= -f2)".zip .
-	popd
-fi
 
 if youtube_t=$(toml_get_table "YouTube"); then youtube_mode=$(toml_get "$youtube_t" "build-mode") || youtube_mode="apk"; else youtube_mode="module"; fi
 if music_t=$(toml_get_table "Music"); then music_mode=$(toml_get "$music_t" "build-mode") || music_mode="apk"; else music_mode="module"; fi
@@ -159,7 +169,7 @@ if [ "$youtube_mode" != module ] || [ "$music_mode" != module ]; then
 	log "\nInstall [Vanced Microg](https://github.com/TeamVanced/VancedMicroG/releases) for non-root YouTube or YT Music"
 fi
 log "\n[revanced-magisk-module](https://github.com/j-hc/revanced-magisk-module)"
-log "\n---\nChangelog:"
+log "\nChangelog:"
 log "$(cat $TEMP_DIR/*-rv/changelog.md)"
 
 pr "Done"
